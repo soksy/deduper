@@ -141,7 +141,11 @@ class MainApp(QWidget):
 
                 for path in cksumToNames[cksum]:
                     if path != cksumToNames[cksum][indexOfPreferred]:
-                        print('Deleting:', path)
+                        try:
+                            os.remove(path)
+                            print("File {} deleted".format(path))
+                        except Exception as e:
+                            print("Could not delete file {}: {}".format(path,e))
                     else:
                         print('Keeping:', cksumToNames[cksum][indexOfPreferred])
 
