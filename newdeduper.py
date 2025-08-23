@@ -1,14 +1,124 @@
 import os
 import hashlib
 import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel
+from typing import Dict, List, Set, Tuple, Optional
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel, QProgressBar
+from PyQt5.QtCore import QThread, pyqtSignal, QObject
+
+class ScanWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_scan = pyqtSignal(list, dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self, directories: List[str]) -> None:
+        super().__init__()
+        self.directories = directories
+    
+    def run(self) -> None:
+        try:
+            self.progress.emit("Starting scan...")
+            dirs_with_dupes, files_dict = self.scan_function(self.directories)
+            self.finished_scan.emit(dirs_with_dupes, files_dict)
+        except Exception as e:
+            self.error.emit(f"Scan error: {str(e)}")
+    
+    def scan_function(self, directories: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+        cksum_to_names = {}
+        dirs_to_prioritise_set = set()
+        
+        total_files = 0
+        processed_files = 0
+        
+        # Count total files first
+        for directory in directories:
+            for root, dirs, files in os.walk(directory):
+                total_files += len(files)
+        
+        for directory in directories:
+            self.progress.emit(f"Scanning directory: {directory}")
+            for root, dirs, files in os.walk(directory):
+                for file in files:
+                    file_path = root.replace('\\','/') + '/' + file
+                    processed_files += 1
+                    
+                    if processed_files % 10 == 0:  # Update progress every 10 files
+                        self.progress.emit(f"Processed {processed_files}/{total_files} files")
+                    
+                    if os.path.getsize(file_path) == 0:
+                        continue
+                    
+                    try:
+                        each_file = File(file_path)
+                        if each_file.cksum in cksum_to_names:
+                            cksum_to_names[each_file.cksum].append(file_path)
+                        else:
+                            cksum_to_names[each_file.cksum] = [file_path]
+                    except Exception as e:
+                        self.progress.emit(f"Error processing {file_path}: {str(e)}")
+                        continue
+        
+        for cksum in cksum_to_names:
+            if len(cksum_to_names[cksum]) > 1:
+                for file in cksum_to_names[cksum]:
+                    dir_path = os.path.dirname(file)
+                    dirs_to_prioritise_set.add(dir_path)
+        
+        return (list(dirs_to_prioritise_set), cksum_to_names)
+
+
+class DedupeWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_dedupe = pyqtSignal()
+    error = pyqtSignal(str)
+    
+    def __init__(self, dir_priority_list: List[str], files_dict: Dict[str, List[str]]) -> None:
+        super().__init__()
+        self.dir_priority_list = dir_priority_list
+        self.files_dict = files_dict
+    
+    def run(self) -> None:
+        try:
+            self.progress.emit("Starting deduplication...")
+            self.dedupe_function(self.dir_priority_list, self.files_dict)
+            self.finished_dedupe.emit()
+        except Exception as e:
+            self.error.emit(f"Deduplication error: {str(e)}")
+    
+    def dedupe_function(self, dir_priority_list: List[str], cksum_to_names: Dict[str, List[str]]) -> None:
+        dir_priorities = {}
+        for dir_path in dir_priority_list:
+            dir_priorities[dir_path] = dir_priority_list.index(dir_path)
+        
+        total_groups = len([cksum for cksum in cksum_to_names if len(cksum_to_names[cksum]) > 1])
+        processed_groups = 0
+        
+        for cksum in cksum_to_names:
+            if len(cksum_to_names[cksum]) > 1:
+                processed_groups += 1
+                self.progress.emit(f"Processing duplicate group {processed_groups}/{total_groups}")
+                
+                index_of_preferred = 0
+                for path in cksum_to_names[cksum]:
+                    if dir_priorities[os.path.dirname(path)] > dir_priorities[os.path.dirname(cksum_to_names[cksum][index_of_preferred])]:
+                        index_of_preferred = cksum_to_names[cksum].index(path)
+                
+                for path in cksum_to_names[cksum]:
+                    if path != cksum_to_names[cksum][index_of_preferred]:
+                        try:
+                            os.remove(path)
+                            self.progress.emit(f"Deleted: {path}")
+                        except Exception as e:
+                            self.progress.emit(f"Could not delete {path}: {str(e)}")
+                    else:
+                        self.progress.emit(f"Kept: {cksum_to_names[cksum][index_of_preferred]}")
+
 
 class MainApp(QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.initUI()
 
-    def initUI(self):
+    def initUI(self) -> None:
         self.setWindowTitle('File De-duper')
         self.setGeometry(100, 100, 800, 400)
 
@@ -40,6 +150,15 @@ class MainApp(QWidget):
         leftButtonLayout.addWidget(self.exitButton)
 
         leftPane.addLayout(leftButtonLayout)
+        
+        # Add progress bar
+        self.progressBar = QProgressBar()
+        self.progressBar.setVisible(False)
+        leftPane.addWidget(self.progressBar)
+        
+        # Add status label
+        self.statusLabel = QLabel("Ready")
+        leftPane.addWidget(self.statusLabel)
 
         # Right Pane
         rightPane = QVBoxLayout()
@@ -71,114 +190,124 @@ class MainApp(QWidget):
         mainLayout.addLayout(rightPane)
 
         self.setLayout(mainLayout)
+        
+        # Initialize worker threads
+        self.scan_worker: Optional[ScanWorker] = None
+        self.dedupe_worker: Optional[DedupeWorker] = None
 
-    def addDirectory(self):
+    def addDirectory(self) -> None:
         dir_path = QFileDialog.getExistingDirectory(self, "Select Directory")
         if dir_path:
             QListWidgetItem(dir_path, self.dirListWidget)
             self.scanButton.setEnabled(True)
 
 
-    def scan(self):
+    def scan(self) -> None:
         directories = [self.dirListWidget.item(i).text() for i in range(self.dirListWidget.count())]
+        
+        # Disable buttons during scan
         self.addDirButton.setEnabled(False)
         self.scanButton.setEnabled(False)
+        self.progressBar.setVisible(True)
+        self.progressBar.setRange(0, 0)  # Indeterminate progress
+        
+        # Start scan worker
+        self.scan_worker = ScanWorker(directories)
+        self.scan_worker.progress.connect(self.update_status)
+        self.scan_worker.finished_scan.connect(self.on_scan_finished)
+        self.scan_worker.error.connect(self.on_scan_error)
+        self.scan_worker.start()
+
+    def on_scan_finished(self, dirs_with_dupes: List[str], files_dict: Dict[str, List[str]]) -> None:
+        self.filesDict = files_dict
+        self.populateRightPane(dirs_with_dupes)
+        
+        # Re-enable buttons
+        self.addDirButton.setEnabled(True)
+        self.scanButton.setEnabled(True)
         self.upButton.setEnabled(True)
         self.downButton.setEnabled(True)
         self.setButton.setEnabled(True)
-        print("Scanning directories:", directories)
-        dirsWithDupes, self.filesDict = self.scanFunction(directories)
-        self.populateRightPane(dirsWithDupes)
+        
+        self.progressBar.setVisible(False)
+        self.update_status("Scan completed")
+    
+    def on_scan_error(self, error_msg: str) -> None:
+        self.addDirButton.setEnabled(True)
+        self.scanButton.setEnabled(True)
+        self.progressBar.setVisible(False)
+        self.update_status(f"Scan failed: {error_msg}")
 
-    def scanFunction(self, directories):
-        cksumToNames = {}
-        dirsToPrioritiseSet = set()
-
-        for directory in directories:
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    filePath = root.replace('\\','/') + '/' + file
-                    if os.path.getsize(filePath) == 0:
-                        continue
-                    eachFile = File(filePath)
-                    if eachFile.cksum in cksumToNames:
-                        cksumToNames[eachFile.cksum].append(filePath)
-                    else:
-                        cksumToNames[eachFile.cksum] = [filePath]
-
-        for cksum in cksumToNames:
-            if len(cksumToNames[cksum]) > 1:
-                for file in cksumToNames[cksum]:
-                    dir = os.path.dirname(file)
-                    dirsToPrioritiseSet.add(dir)
-
-        return (list(dirsToPrioritiseSet), cksumToNames)
-
-    def populateRightPane(self, items):
+    def populateRightPane(self, items: List[str]) -> None:
         self.resultListWidget.clear()
         for item in items:
             QListWidgetItem(item, self.resultListWidget)
 
-    def dedupe(self):
-        self.dedupeButton.setEnabled(False) 
+    def dedupe(self) -> None:
+        # Disable buttons during deduplication
+        self.dedupeButton.setEnabled(False)
         self.upButton.setEnabled(False)
         self.downButton.setEnabled(False)
         self.setButton.setEnabled(False)
-        self.deDupeFunction(self.dirPriorityList, self.filesDict)
+        self.progressBar.setVisible(True)
+        self.progressBar.setRange(0, 0)  # Indeterminate progress
+        
+        # Start dedupe worker
+        self.dedupe_worker = DedupeWorker(self.dirPriorityList, self.filesDict)
+        self.dedupe_worker.progress.connect(self.update_status)
+        self.dedupe_worker.finished_dedupe.connect(self.on_dedupe_finished)
+        self.dedupe_worker.error.connect(self.on_dedupe_error)
+        self.dedupe_worker.start()
 
-    def deDupeFunction(self, dirPriorityList, cksumToNames):
-        dirPriorities = {}
-        print("In DeDupeFunction", dirPriorityList)
-        for dir in dirPriorityList:
-            dirPriorities[dir] = dirPriorityList.index(dir)
+    def on_dedupe_finished(self) -> None:
+        # Re-enable buttons
+        self.addDirButton.setEnabled(True)
+        self.scanButton.setEnabled(True)
+        
+        self.progressBar.setVisible(False)
+        self.update_status("Deduplication completed")
+    
+    def on_dedupe_error(self, error_msg: str) -> None:
+        self.dedupeButton.setEnabled(True)
+        self.upButton.setEnabled(True)
+        self.downButton.setEnabled(True)
+        self.setButton.setEnabled(True)
+        self.progressBar.setVisible(False)
+        self.update_status(f"Deduplication failed: {error_msg}")
+    
+    def update_status(self, message: str) -> None:
+        self.statusLabel.setText(message)
 
-        for cksum in cksumToNames:
-            if len(cksumToNames[cksum]) > 1:
-                indexOfPreferred = 0
-                for path in cksumToNames[cksum]:
-                    if dirPriorities[os.path.dirname(path)] > dirPriorities[os.path.dirname(cksumToNames[cksum][indexOfPreferred])]:
-                        indexOfPreferred = cksumToNames[cksum].index(path)
-
-                for path in cksumToNames[cksum]:
-                    if path != cksumToNames[cksum][indexOfPreferred]:
-                        try:
-                            os.remove(path)
-                            print("File {} deleted".format(path))
-                        except Exception as e:
-                            print("Could not delete file {}: {}".format(path,e))
-                    else:
-                        print('Keeping:', cksumToNames[cksum][indexOfPreferred])
-
-    def moveUp(self):
+    def moveUp(self) -> None:
         currentRow = self.resultListWidget.currentRow()
         if currentRow > 0:
             currentItem = self.resultListWidget.takeItem(currentRow)
             self.resultListWidget.insertItem(currentRow - 1, currentItem)
             self.resultListWidget.setCurrentRow(currentRow - 1)
 
-    def moveDown(self):
+    def moveDown(self) -> None:
         currentRow = self.resultListWidget.currentRow()
         if currentRow < self.resultListWidget.count() - 1:
             currentItem = self.resultListWidget.takeItem(currentRow)
             self.resultListWidget.insertItem(currentRow + 1, currentItem)
             self.resultListWidget.setCurrentRow(currentRow + 1)
 
-    def setOrder(self):
+    def setOrder(self) -> None:
         self.dirPriorityList = [self.resultListWidget.item(i).text() for i in range(self.resultListWidget.count())]
         self.dedupeButton.setEnabled(True)
-        print("New order set:", self.dirPriorityList)
+        self.update_status(f"Priority order set for {len(self.dirPriorityList)} directories")
 
-    def exitApp(self):
+    def exitApp(self) -> None:
         self.close()
 
 class File:
-    def __init__(self, filename):
+    def __init__(self, filename: str) -> None:
         self.fullFilename = filename
         self.basename = os.path.basename(filename)
         self.dirname = os.path.dirname(filename)
         self.cksum = self.generate_checksum()
 
-    def generate_checksum(self):
+    def generate_checksum(self) -> str:
         hash_func = hashlib.new('sha256')
         with open(self.fullFilename, 'rb') as f:
             while chunk := f.read(8192):
