@@ -120,7 +120,7 @@ class MainApp(QWidget):
 
     def initUI(self) -> None:
         self.setWindowTitle('File De-duper')
-        self.setGeometry(100, 100, 800, 400)
+        self.setGeometry(100, 100, 1200, 400)
 
         mainLayout = QHBoxLayout()
 
@@ -133,19 +133,27 @@ class MainApp(QWidget):
 
         leftButtonLayout = QHBoxLayout()
         self.addDirButton = QPushButton('Add Dir')
+        self.delDirButton = QPushButton('Del Dir')
+        self.delDirButton.setEnabled(False)
         self.scanButton = QPushButton('Scan')
         self.scanButton.setEnabled(False)
+        self.dryRunButton = QPushButton('Dry Run')
+        self.dryRunButton.setEnabled(False)
         self.dedupeButton = QPushButton('De-dupe')
         self.dedupeButton.setEnabled(False)
         self.exitButton = QPushButton('Exit')
 
         self.addDirButton.clicked.connect(self.addDirectory)
+        self.delDirButton.clicked.connect(self.delDirectory)
         self.scanButton.clicked.connect(self.scan)
+        self.dryRunButton.clicked.connect(self.dryRun)
         self.dedupeButton.clicked.connect(self.dedupe)
         self.exitButton.clicked.connect(self.exitApp)
 
         leftButtonLayout.addWidget(self.addDirButton)
+        leftButtonLayout.addWidget(self.delDirButton)
         leftButtonLayout.addWidget(self.scanButton)
+        leftButtonLayout.addWidget(self.dryRunButton)
         leftButtonLayout.addWidget(self.dedupeButton)
         leftButtonLayout.addWidget(self.exitButton)
 
@@ -160,15 +168,15 @@ class MainApp(QWidget):
         self.statusLabel = QLabel("Ready")
         leftPane.addWidget(self.statusLabel)
 
-        # Right Pane
-        rightPane = QVBoxLayout()
-        rightLabel = QLabel("Prioritise Directories (Lower in list preferred)")
+        # Middle Pane
+        middlePane = QVBoxLayout()
+        middleLabel = QLabel("Prioritise Directories (Lower in list preferred)")
         self.resultListWidget = QListWidget()
-        rightPane.addWidget(rightLabel)
+        middlePane.addWidget(middleLabel)
         self.resultListWidget.setDragDropMode(QListWidget.InternalMove)
-        rightPane.addWidget(self.resultListWidget)
+        middlePane.addWidget(self.resultListWidget)
 
-        rightButtonLayout = QHBoxLayout()
+        middleButtonLayout = QHBoxLayout()
         self.upButton = QPushButton('Up')
         self.upButton.setEnabled(False)
         self.downButton = QPushButton('Down')
@@ -180,14 +188,39 @@ class MainApp(QWidget):
         self.downButton.clicked.connect(self.moveDown)
         self.setButton.clicked.connect(self.setOrder)
 
-        rightButtonLayout.addWidget(self.upButton)
-        rightButtonLayout.addWidget(self.downButton)
-        rightButtonLayout.addWidget(self.setButton)
+        middleButtonLayout.addWidget(self.upButton)
+        middleButtonLayout.addWidget(self.downButton)
+        middleButtonLayout.addWidget(self.setButton)
 
-        rightPane.addLayout(rightButtonLayout)
+        middlePane.addLayout(middleButtonLayout)
+        
+        # Add spacer to align with left pane
+        middlePane.addWidget(QLabel(""))
+        middlePane.addWidget(QLabel(""))
 
-        mainLayout.addLayout(leftPane)
-        mainLayout.addLayout(rightPane)
+        # Right Pane (Files to Delete)
+        rightPane = QVBoxLayout()
+        rightLabel = QLabel("Files to Delete (Dry Run)")
+        self.filesToDeleteListWidget = QListWidget()
+        rightPane.addWidget(rightLabel)
+        rightPane.addWidget(self.filesToDeleteListWidget)
+        
+        # Add spacer to align with left and middle panes
+        rightPane.addWidget(QLabel(""))
+        rightPane.addWidget(QLabel(""))
+        rightPane.addWidget(QLabel(""))
+
+        # Set equal stretch for all panes
+        leftPaneWidget = QWidget()
+        leftPaneWidget.setLayout(leftPane)
+        middlePaneWidget = QWidget()
+        middlePaneWidget.setLayout(middlePane)
+        rightPaneWidget = QWidget()
+        rightPaneWidget.setLayout(rightPane)
+        
+        mainLayout.addWidget(leftPaneWidget, 1)
+        mainLayout.addWidget(middlePaneWidget, 1)
+        mainLayout.addWidget(rightPaneWidget, 1)
 
         self.setLayout(mainLayout)
         
@@ -200,7 +233,15 @@ class MainApp(QWidget):
         if dir_path:
             QListWidgetItem(dir_path, self.dirListWidget)
             self.scanButton.setEnabled(True)
+            self.delDirButton.setEnabled(True)
 
+    def delDirectory(self) -> None:
+        current_row = self.dirListWidget.currentRow()
+        if current_row >= 0:
+            self.dirListWidget.takeItem(current_row)
+            if self.dirListWidget.count() == 0:
+                self.scanButton.setEnabled(False)
+                self.delDirButton.setEnabled(False)
 
     def scan(self) -> None:
         directories = [self.dirListWidget.item(i).text() for i in range(self.dirListWidget.count())]
@@ -295,7 +336,41 @@ class MainApp(QWidget):
     def setOrder(self) -> None:
         self.dirPriorityList = [self.resultListWidget.item(i).text() for i in range(self.resultListWidget.count())]
         self.dedupeButton.setEnabled(True)
+        self.dryRunButton.setEnabled(True)
         self.update_status(f"Priority order set for {len(self.dirPriorityList)} directories")
+
+    def dryRun(self) -> None:
+        if not hasattr(self, 'dirPriorityList') or not hasattr(self, 'filesDict'):
+            self.update_status("Please scan and set priority order first")
+            return
+        
+        self.filesToDeleteListWidget.clear()
+        files_to_delete = self.generateFilesToDelete(self.dirPriorityList, self.filesDict)
+        
+        for file_path in files_to_delete:
+            QListWidgetItem(file_path, self.filesToDeleteListWidget)
+        
+        self.update_status(f"Dry run completed - {len(files_to_delete)} files would be deleted")
+
+    def generateFilesToDelete(self, dir_priority_list: List[str], cksum_to_names: Dict[str, List[str]]) -> List[str]:
+        dir_priorities = {}
+        for dir_path in dir_priority_list:
+            dir_priorities[dir_path] = dir_priority_list.index(dir_path)
+        
+        files_to_delete = []
+        
+        for cksum in cksum_to_names:
+            if len(cksum_to_names[cksum]) > 1:
+                index_of_preferred = 0
+                for path in cksum_to_names[cksum]:
+                    if dir_priorities[os.path.dirname(path)] > dir_priorities[os.path.dirname(cksum_to_names[cksum][index_of_preferred])]:
+                        index_of_preferred = cksum_to_names[cksum].index(path)
+                
+                for path in cksum_to_names[cksum]:
+                    if path != cksum_to_names[cksum][index_of_preferred]:
+                        files_to_delete.append(path)
+        
+        return sorted(files_to_delete)
 
     def exitApp(self) -> None:
         self.close()
